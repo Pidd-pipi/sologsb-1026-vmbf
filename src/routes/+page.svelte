@@ -4,6 +4,7 @@
     Button,
     Checkbox,
     InlineNotification,
+    NotificationActionButton,
     Select,
     SelectItem,
     Tag,
@@ -11,62 +12,42 @@
     TextInput,
     Tile
   } from 'carbon-components-svelte';
+  import {
+    activityFingerprint,
+    cloneCourse,
+    fieldLabel,
+    isConflictResolved,
+    mergeCourses,
+    refreshReportStaleness,
+    refreshVersionStaleness,
+    resolveMergedCourse,
+    type Activity,
+    type ActivityType,
+    type CheckReport,
+    type ConflictItem,
+    type Course,
+    type CourseVersion,
+    type Diagnostic,
+    type ResolutionMap
+  } from '$lib/collaboration';
 
-  type ActivityType = '音素' | '单词' | '句子' | '练习';
   type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
-  type IssueLevel = 'error' | 'warning' | 'info';
 
-  interface Activity {
-    id: string;
-    type: ActivityType;
-    title: string;
-    content: string;
-    phonemes: string[];
-    dependencies: string[];
-    difficulty: number;
-    prompt: string;
-    accessibility: string;
-    duration: number;
-    feedback: string;
-  }
-
-  interface CourseVersion {
-    id: string;
-    label: string;
-    savedAt: string;
-    note: string;
-    activities: Activity[];
-  }
-
-  interface Course {
-    id: string;
-    title: string;
-    level: string;
-    ageRange: string;
-    objective: string;
-    activities: Activity[];
-    versions: CourseVersion[];
-    updatedAt: string;
-  }
-
-  interface Diagnostic {
-    id: string;
-    activityId: string;
-    level: IssueLevel;
-    category: string;
-    title: string;
-    detail: string;
-  }
-
-  interface VersionDiff {
+  interface VersionDiffLocal {
     id: string;
     title: string;
     kind: 'added' | 'removed' | 'changed';
     detail: string;
   }
 
-  const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const STORAGE_KEY = 'sologsb-1026-phonics-course-v2';
+  const REPORT_KEY = 'sologsb-1026-check-report-v2';
+  const CONFLICT_KEY = 'sologsb-1026-pending-conflicts-v2';
+  const DRAFT_KEY_PREFIX = 'sologsb-1026-tab-draft-';
+  const TAB_ID_KEY = 'sologsb-1026-tab-id';
+  const DRAFT_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+  const HEARTBEAT_MS = 5000;
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
@@ -78,6 +59,7 @@
     ageRange: '5–6 岁',
     objective: '建立音素意识，能听辨、拼读并书写短元音单词。',
     updatedAt: '2026-09-24T16:20:00+08:00',
+    revision: 1,
     activities: [
       {
         id: 'a-1', type: '音素', title: '听音游戏：认识 /m/', content: '/m/',
@@ -131,7 +113,7 @@
     versions: [
       {
         id: 'v-1', label: '初稿', savedAt: '2026-09-21T10:00:00+08:00', note: '完成音素和基础拼读活动。',
-        activities: []
+        activities: [], sealed: true, fingerprint: 'af-0-0'
       },
       {
         id: 'v-2', label: '增加句子迁移', savedAt: '2026-09-24T15:30:00+08:00', note: '补充 A man sat and had a nap.',
@@ -152,10 +134,31 @@
             id: 'a-6', type: '句子', title: '拼读句子：Mat sat.', content: 'Mat sat on the mat.', phonemes: ['/m/', '/æ/', '/s/', '/t/'], dependencies: ['a-3'], difficulty: 3,
             prompt: '先读每个单词，再按意群连读。', accessibility: '按词高亮。', duration: 10, feedback: '再试试更连贯。'
           }
-        ]
+        ],
+        sealed: true,
+        fingerprint: ''
       }
     ]
   });
+
+  interface PendingConflictRecord {
+    id: string;
+    createdAt: string;
+    updatedAt: string;
+    tabId: string;
+    base: Course;
+    ours: Course;
+    theirs: Course;
+    conflicts: ConflictItem[];
+    resolutions: ResolutionMap;
+  }
+
+  interface TabDraft {
+    tabId: string;
+    savedAt: string;
+    base: Course;
+    draft: Course;
+  }
 
   let course: Course = initialCourse();
   let selectedActivityId = course.activities[0]?.id ?? '';
@@ -171,29 +174,63 @@
   let future: Course[] = [];
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
-  let versionDiff: VersionDiff[] = [];
+  let versionDiff: VersionDiffLocal[] = [];
+  let usableVersions: CourseVersion[] = [];
+
+  // 多标签页协作状态
+  let tabId = '';
+  let syncedRevision = 0;
+  let remoteNotice = '';
+  let conflictPanelOpen = false;
+  let activeConflict: PendingConflictRecord | null = null;
+  let conflictResolutions: ResolutionMap = {};
+  let orphanDraftNotice = '';
+  let orphanDraft: TabDraft | null = null;
+  let applyError = '';
+  let lastSavedRevision = 0;
+
+  let checkReport: CheckReport | null = null;
+  let staleNotice = '';
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
+  $: usableVersions = course.versions.filter((version) => !version.stale);
   $: versionDiff = compareCourseVersions(course, compareBaseId, compareTargetId);
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: unresolvedCount = activeConflict
+    ? activeConflict.conflicts.filter((item) => !isConflictResolved(item, conflictResolutions[item.key])).length
+    : 0;
 
   onMount(() => {
+    tabId = getTabId();
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       try {
-        course = migrateCourse(JSON.parse(stored) as Course);
-        selectedActivityId = course.activities[0]?.id ?? '';
-        compareBaseId = course.versions[0]?.id ?? '';
-        compareTargetId = course.versions.at(-1)?.id ?? '';
-        savedLabel = `已恢复 · ${formatTime(course.updatedAt)}`;
+        const parsed = JSON.parse(stored) as Course;
+        if (parsed.id && Array.isArray(parsed.activities)) {
+          course = migrateCourse(parsed);
+        }
       } catch {
         localStorage.removeItem(STORAGE_KEY);
       }
     }
+    course = refreshCourseStaleness(course);
+    course = normalizeRevision(course);
+    selectedActivityId = course.activities[0]?.id ?? '';
+    ensureValidCompareSelection();
+    syncedRevision = course.revision;
+    lastSavedRevision = course.revision;
+    loadCheckReport(course);
+    if (!checkReport) recomputeCheckReport(null, course);
+    recoverStoredConflict();
+    recoverOrphanDraft();
+    savedLabel = `已载入 · 修订 ${course.revision}`;
     hydrated = true;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
+    persistTabDraft();
+
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -201,56 +238,237 @@
     updateNetwork();
     window.addEventListener('online', updateNetwork);
     window.addEventListener('offline', updateNetwork);
+    window.addEventListener('storage', handleStorage);
+    const heartbeat = window.setInterval(() => persistTabDraft(), HEARTBEAT_MS);
+    window.addEventListener('beforeunload', () => persistTabDraft());
+
     return () => {
       window.removeEventListener('online', updateNetwork);
       window.removeEventListener('offline', updateNetwork);
+      window.removeEventListener('storage', handleStorage);
+      window.clearInterval(heartbeat);
+      persistTabDraft();
     };
   });
 
+  function getTabId(): string {
+    let id = sessionStorage.getItem(TAB_ID_KEY);
+    if (!id) {
+      id = `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      sessionStorage.setItem(TAB_ID_KEY, id);
+    }
+    return id;
+  }
+
   function migrateCourse(value: Course): Course {
-    if (!value.id || !Array.isArray(value.activities)) return initialCourse();
+    const fallback = initialCourse();
+    if (!value.id || !Array.isArray(value.activities)) return fallback;
     value.versions ??= [];
+    value.revision ??= 1;
+    value.versions = value.versions.map((version) => ({
+      ...version,
+      // 旧版本视为已封存快照，继续有效；新保存的版本默认未封存。
+      sealed: version.sealed ?? true,
+      fingerprint: version.fingerprint || activityFingerprint(version.activities)
+    }));
+    value.activities = value.activities.map((activity) => ({
+      ...activity,
+      phonemes: Array.isArray(activity.phonemes) ? activity.phonemes : [],
+      dependencies: Array.isArray(activity.dependencies) ? activity.dependencies : []
+    }));
     return value;
   }
 
+  function normalizeRevision(value: Course): Course {
+    if (typeof value.revision !== 'number' || !Number.isFinite(value.revision)) value.revision = 1;
+    return value;
+  }
+
+  function refreshCourseStaleness(value: Course): Course {
+    value.versions = refreshVersionStaleness(value.versions, value);
+    return value;
+  }
+
+  function ensureValidCompareSelection(): void {
+    const usable = course.versions.filter((version) => !version.stale);
+    if (course.versions.find((version) => version.id === compareBaseId)?.stale || !usable.some((version) => version.id === compareBaseId)) {
+      compareBaseId = usable[0]?.id ?? '';
+    }
+    if (course.versions.find((version) => version.id === compareTargetId)?.stale || !usable.some((version) => version.id === compareTargetId)) {
+      compareTargetId = usable.at(-1)?.id ?? '';
+    }
+  }
+
+  // ---------- 检查报告 ----------
+
+  function loadCheckReport(current: Course): void {
+    const stored = localStorage.getItem(REPORT_KEY);
+    if (!stored) {
+      checkReport = null;
+      staleNotice = '';
+      return;
+    }
+    try {
+      const report = JSON.parse(stored) as CheckReport;
+      checkReport = refreshReportStaleness(report, current);
+    } catch {
+      localStorage.removeItem(REPORT_KEY);
+      checkReport = null;
+    }
+  }
+
+  function recomputeCheckReport(previous: CheckReport | null, current: Course): void {
+    if (previous && previous.fingerprint !== activityFingerprint(current.activities)) {
+      staleNotice = `上一份检查基于修订 ${previous.revision}，活动已变化：旧结果已标为过期，并按修订 ${current.revision} 重新检查。`;
+    }
+    const fresh: CheckReport = {
+      id: `report-${Date.now()}`,
+      label: `检查报告 · 修订 ${current.revision}`,
+      revision: current.revision,
+      fingerprint: activityFingerprint(current.activities),
+      checkedAt: new Date().toISOString(),
+      diagnostics: analyzeCourse(current),
+      stale: false
+    };
+    checkReport = fresh;
+    if (hydrated) localStorage.setItem(REPORT_KEY, JSON.stringify(fresh));
+  }
+
+  function dismissStaleNotice(): void {
+    staleNotice = '';
+  }
+
+  // ---------- 本地编辑 ----------
+
   function commit(recipe: (draft: Course) => void): void {
-    history = [...history.slice(-49), structuredClone(course)];
-    const next = structuredClone(course);
+    history = [...history.slice(-49), cloneCourse(course)];
+    const next = cloneCourse(course);
     recipe(next);
     next.updatedAt = new Date().toISOString();
+    finalizeLocalCourse(next);
     course = next;
     future = [];
-    persist();
+    saveLocalAfterEdit();
+  }
+
+  function finalizeLocalCourse(next: Course): void {
+    const previousReport = checkReport;
+    next.versions = refreshVersionStaleness(next.versions, next);
+    next.activities = next.activities.map((activity) => ({
+      ...activity,
+      dependencies: activity.dependencies.filter((dep) =>
+        next.activities.some((item) => item.id === dep) && dep !== activity.id
+      )
+    }));
+    ensureValidCompareSelectionFor(next);
+    recomputeCheckReport(previousReport, next);
+  }
+
+  function ensureValidCompareSelectionFor(target: Course): void {
+    const usableIds = new Set(target.versions.filter((version) => !version.stale).map((version) => version.id));
+    if (!usableIds.has(compareBaseId)) compareBaseId = [...usableIds][0] ?? '';
+    if (!usableIds.has(compareTargetId)) compareTargetId = [...usableIds].at(-1) ?? '';
   }
 
   function persist(): void {
+    saveLocalAfterEdit();
+  }
+
+  /**
+   * 本地自动保存：先读其他标签页的最新修订，再做三向合并。
+   * - 无并发：直接写入并 +1；
+   * - 只有非重叠字段变化：自动合并；
+   * - 顺序/依赖/音素等关键字段冲突：保留双方草稿，等待老师确认。
+   */
+  function saveLocalAfterEdit(): void {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
-    savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
+    const remote = readRemoteCourse();
+    if (!remote || remote.revision <= syncedRevision) {
+      const next = cloneCourse(course);
+      next.revision = syncedRevision + 1;
+      course = next;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      syncedRevision = next.revision;
+      lastSavedRevision = next.revision;
+      savedLabel = `已保存 · 修订 ${next.revision}`;
+      persistTabDraft();
+      return;
+    }
+    const base = loadTabDraftBase(remote);
+    const ours = cloneCourse(course);
+    ours.revision = syncedRevision;
+    const result = mergeCourses(base, ours, remote, {});
+    if (result.merged) {
+      adoptMergedCourse(result.merged, remote, true);
+      return;
+    }
+    openConflictPanel(base, ours, remote, result.conflicts, {});
+  }
+
+  function readRemoteCourse(): Course | null {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (!stored) return null;
+    try {
+      return normalizeRevision(JSON.parse(stored) as Course);
+    } catch {
+      return null;
+    }
+  }
+
+  function loadTabDraftBase(remote: Course): Course {
+    const draft = readOwnDraft();
+    if (draft) return normalizeRevision(draft.base);
+    // 找不到本标签页基线时，用远端课程作为共同基线，本页改动按相对远端计算。
+    return cloneCourse(remote);
+  }
+
+  function adoptMergedCourse(merged: Course, remote: Course, automatic: boolean): void {
+    const previousReport = checkReport;
+    merged.versions = refreshVersionStaleness(merged.versions, merged);
+    ensureValidCompareSelectionFor(merged);
+    course = merged;
+    syncedRevision = merged.revision;
+    recomputeCheckReport(previousReport, merged);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+    lastSavedRevision = merged.revision;
+    savedLabel = automatic
+      ? `已合并其他标签页修改 · 修订 ${merged.revision}`
+      : `冲突已解决并保存 · 修订 ${merged.revision}`;
+    remoteNotice = automatic
+      ? `检测到其他标签页的修订 ${remote.revision}，互不重叠的修改已自动合并到修订 ${merged.revision}。`
+      : '';
+    persistTabDraft(true, merged);
+    pruneDrafts();
   }
 
   function undo(): void {
     const previous = history.at(-1);
     if (!previous) return;
-    future = [structuredClone(course), ...future].slice(0, 50);
+    future = [cloneCourse(course), ...future].slice(0, 50);
     history = history.slice(0, -1);
-    course = previous;
+    course = refreshCourseStaleness(cloneCourse(previous));
     selectedActivityId = course.activities[0]?.id ?? '';
-    persist();
+    finalizeLocalCourse(course);
+    saveLocalAfterEdit();
   }
 
   function redo(): void {
     const next = future[0];
     if (!next) return;
-    history = [...history, structuredClone(course)].slice(-50);
+    history = [...history, cloneCourse(course)].slice(-50);
     future = future.slice(1);
-    course = next;
+    course = refreshCourseStaleness(cloneCourse(next));
     selectedActivityId = course.activities[0]?.id ?? '';
-    persist();
+    finalizeLocalCourse(course);
+    saveLocalAfterEdit();
   }
 
   function saveNow(): void {
-    persist();
+    if (conflictPanelOpen && activeConflict) {
+      applyConflictResolutions();
+      return;
+    }
+    saveLocalAfterEdit();
   }
 
   function updateCourse(field: 'title' | 'level' | 'ageRange' | 'objective', value: string): void {
@@ -294,7 +512,7 @@
       draft.activities.push({
         id, type, title: `新的${type}活动`, content: '', phonemes: [], dependencies: [],
         difficulty: 1, prompt: '请输入教师提示语。', accessibility: '请描述视觉、听觉或键盘无障碍支持。',
-        duration: type === '练习' ? 10 : 8, feedback: type === '练习' ? '' : ''
+        duration: type === '练习' ? 10 : 8, feedback: ''
       });
     });
     selectedActivityId = id;
@@ -356,13 +574,52 @@
       draft.versions.push({
         id: `v-${Date.now()}`, label: `版本 ${versionNumber}`, savedAt: new Date().toISOString(),
         note: `保存 ${draft.activities.length} 个活动，总计 ${draft.activities.reduce((sum, item) => sum + item.duration, 0)} 分钟。`,
-        activities: structuredClone(draft.activities)
+        activities: structuredClone(draft.activities),
+        sealed: false,
+        fingerprint: activityFingerprint(draft.activities),
+        stale: false
       });
     });
-    const latest = course.versions.at(-1);
+    const latest = usableVersions.at(-1);
     compareTargetId = latest?.id ?? '';
-    if (!compareBaseId) compareBaseId = course.versions.at(-2)?.id ?? '';
-    savedLabel = `版本 ${versionNumber} 已存档`;
+    if (!compareBaseId) compareBaseId = usableVersions.at(-2)?.id ?? '';
+    savedLabel = `版本 ${versionNumber} 已保存（未封存）· 修订 ${course.revision}`;
+  }
+
+  function sealVersion(versionId: string): void {
+    commit((draft) => {
+      const target = draft.versions.find((version) => version.id === versionId);
+      if (!target) return;
+      target.sealed = true;
+      target.fingerprint = activityFingerprint(target.activities);
+      target.stale = false;
+      target.staleReason = undefined;
+      if (!target.label.includes('已封存')) target.label = `${target.label}（已封存）`;
+    });
+  }
+
+  function copyVersion(versionId: string): void {
+    const source = course.versions.find((version) => version.id === versionId);
+    if (!source || source.stale) return;
+    const idMap = new Map<string, string>();
+    source.activities.forEach((activity) => {
+      idMap.set(activity.id, `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${idMap.size}`);
+    });
+    const copies: Activity[] = source.activities.map((activity) => {
+      const copy = structuredClone(activity);
+      copy.id = idMap.get(activity.id)!;
+      copy.dependencies = activity.dependencies
+        .map((dep) => idMap.get(dep))
+        .filter((dep): dep is string => Boolean(dep));
+      copy.title = `${copy.title}（复制）`;
+      return copy;
+    });
+    commit((draft) => {
+      draft.activities = copies;
+    });
+    selectedActivityId = copies[0]?.id ?? '';
+    activeView = 'compose';
+    savedLabel = `已从封存版本复制 ${copies.length} 个活动 · 修订 ${course.revision}`;
   }
 
   function copyCourse(): void {
@@ -379,7 +636,7 @@
       draft.versions = copy.versions;
       draft.activities = copy.activities;
     });
-    savedLabel = '课程已复制为新草稿';
+    savedLabel = `课程已复制为新草稿 · 修订 ${course.revision}`;
   }
 
   function focusIssue(issue: Diagnostic): void {
@@ -478,11 +735,11 @@
     return cycle.length ? cycle : null;
   }
 
-  function compareCourseVersions(current: Course, baseId: string, targetId: string): VersionDiff[] {
+  function compareCourseVersions(current: Course, baseId: string, targetId: string): VersionDiffLocal[] {
     const base = current.versions.find((version) => version.id === baseId);
     const target = current.versions.find((version) => version.id === targetId);
-    if (!base || !target) return [];
-    const rows: VersionDiff[] = [];
+    if (!base || !target || base.stale || target.stale) return [];
+    const rows: VersionDiffLocal[] = [];
     const baseMap = new Map(base.activities.map((activity) => [activity.id, activity]));
     const targetMap = new Map(target.activities.map((activity) => [activity.id, activity]));
     for (const activity of base.activities) {
@@ -513,8 +770,300 @@
     return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
   }
 
-  function activityIcon(type: ActivityType): string {
-    return type === '音素' ? 'ear' : type === '单词' ? 'text-font' : type === '句子' ? 'text-align-left' : 'game-console';
+  // ---------- 跨标签页事件 ----------
+
+  function handleStorage(event: StorageEvent): void {
+    if (!hydrated) return;
+    if (event.key === STORAGE_KEY) {
+      const remote = readRemoteCourse();
+      if (!remote || remote.revision <= syncedRevision) return;
+      if (isLocallyClean(remote)) {
+        const previousReport = checkReport;
+        const refreshed = refreshCourseStaleness(cloneCourse(remote));
+        course = refreshed;
+        syncedRevision = refreshed.revision;
+        selectedActivityId = refreshed.activities[0]?.id ?? '';
+        ensureValidCompareSelection();
+        recomputeCheckReport(previousReport, refreshed);
+        remoteNotice = `已同步其他标签页的修订 ${remote.revision}。`;
+        persistTabDraft(true, refreshed);
+      } else {
+        remoteNotice = `其他标签页已保存修订 ${remote.revision}。本标签页有未合并修改，点击“合并并保存”进行协作合并。`;
+      }
+    } else if (event.key === CONFLICT_KEY) {
+      if (!activeConflict) recoverStoredConflict();
+    }
+  }
+
+  function isLocallyClean(remote: Course): boolean {
+    const ours = cloneCourse(course);
+    const remoteCopy = cloneCourse(remote);
+    ours.revision = syncedRevision;
+    remoteCopy.revision = syncedRevision;
+    ours.updatedAt = '';
+    remoteCopy.updatedAt = '';
+    return JSON.stringify(ours) === JSON.stringify(remoteCopy);
+  }
+
+  function mergeFromNotice(): void {
+    const remote = readRemoteCourse();
+    if (!remote) return;
+    const base = loadTabDraftBase(remote);
+    const ours = cloneCourse(course);
+    ours.revision = syncedRevision;
+    const result = mergeCourses(base, ours, remote, {});
+    if (result.merged) {
+      adoptMergedCourse(result.merged, remote, true);
+      return;
+    }
+    openConflictPanel(base, ours, remote, result.conflicts, {});
+  }
+
+  function dismissRemoteNotice(): void {
+    remoteNotice = '';
+  }
+
+  // ---------- 冲突面板 ----------
+
+  function openConflictPanel(
+    base: Course,
+    ours: Course,
+    theirs: Course,
+    conflicts: ConflictItem[],
+    resolutions: ResolutionMap
+  ): void {
+    const record: PendingConflictRecord = {
+      id: `conflict-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      tabId,
+      base,
+      ours,
+      theirs,
+      conflicts,
+      resolutions
+    };
+    activeConflict = record;
+    conflictResolutions = { ...resolutions };
+    conflictPanelOpen = true;
+    applyError = '';
+    localStorage.setItem(CONFLICT_KEY, JSON.stringify(record));
+    savedLabel = `保存暂停：${conflicts.length} 处协作冲突待确认`;
+  }
+
+  function closeConflictPanel(): void {
+    conflictPanelOpen = false;
+    if (activeConflict) {
+      activeConflict.updatedAt = new Date().toISOString();
+      activeConflict.resolutions = conflictResolutions;
+      localStorage.setItem(CONFLICT_KEY, JSON.stringify(activeConflict));
+      savedLabel = `冲突草稿已保留 · ${activeConflict.conflicts.length} 处待确认`;
+    }
+  }
+
+  function resumeConflictPanel(): void {
+    if (!activeConflict) return;
+    conflictResolutions = { ...activeConflict.resolutions };
+    conflictPanelOpen = true;
+    applyError = '';
+  }
+
+  function setResolution(conflict: ConflictItem, choice: string): void {
+    conflictResolutions = {
+      ...conflictResolutions,
+      [conflict.key]: { choice, customValue: conflictResolutions[conflict.key]?.customValue ?? '' }
+    };
+    applyError = '';
+  }
+
+  function setCustomResolution(conflict: ConflictItem, value: string): void {
+    conflictResolutions = {
+      ...conflictResolutions,
+      [conflict.key]: { choice: 'custom', customValue: value }
+    };
+  }
+
+  function resolutionChoice(conflict: ConflictItem): string {
+    return conflictResolutions[conflict.key]?.choice ?? '';
+  }
+
+  function resolutionCustom(conflict: ConflictItem): string {
+    return conflictResolutions[conflict.key]?.customValue ?? '';
+  }
+
+  function applyConflictResolutions(): void {
+    if (!activeConflict) return;
+    const unresolved = activeConflict.conflicts.filter(
+      (item) => !isConflictResolved(item, conflictResolutions[item.key])
+    );
+    if (unresolved.length) {
+      applyError = `还有 ${unresolved.length} 处冲突未确认（包括：${unresolved
+        .slice(0, 3)
+        .map((item) => item.title)
+        .join('；')}）。双方草稿均已保留，确认全部条目后才会生效。`;
+      return;
+    }
+    // 以存储中的最新远端重新合并，避免确认期间对方又保存了新修订。
+    const latestRemote = readRemoteCourse();
+    const theirs = latestRemote && latestRemote.revision >= activeConflict.theirs.revision ? latestRemote : activeConflict.theirs;
+    const result = resolveMergedCourse(activeConflict.base, activeConflict.ours, theirs, conflictResolutions);
+    if (!result.merged || result.conflicts.length) {
+      activeConflict = {
+        ...activeConflict,
+        theirs,
+        conflicts: result.conflicts,
+        updatedAt: new Date().toISOString()
+      };
+      applyError = '其他标签页在此期间又保存了新修改，已刷新冲突清单，请再次确认。双方草稿仍然保留。';
+      localStorage.setItem(CONFLICT_KEY, JSON.stringify(activeConflict));
+      return;
+    }
+    const merged = result.merged;
+    course = cloneCourse(merged);
+    adoptMergedCourse(merged, theirs, false);
+    localStorage.removeItem(CONFLICT_KEY);
+    activeConflict = null;
+    conflictPanelOpen = false;
+    conflictResolutions = {};
+    applyError = '';
+  }
+
+  function discardConflictDraft(): void {
+    localStorage.removeItem(CONFLICT_KEY);
+    if (activeConflict) {
+      const keepOurs = cloneCourse(activeConflict.ours);
+      course = keepOurs;
+      syncedRevision = activeConflict.base.revision;
+    }
+    activeConflict = null;
+    conflictPanelOpen = false;
+    conflictResolutions = {};
+    applyError = '';
+    savedLabel = '冲突记录已放弃，继续编辑本标签页草稿';
+    persistTabDraft();
+  }
+
+  function recoverStoredConflict(): void {
+    const stored = localStorage.getItem(CONFLICT_KEY);
+    if (!stored) return;
+    try {
+      const record = JSON.parse(stored) as PendingConflictRecord;
+      if (!record.base || !record.ours || !record.theirs || !Array.isArray(record.conflicts)) {
+        localStorage.removeItem(CONFLICT_KEY);
+        return;
+      }
+      activeConflict = record;
+      conflictResolutions = { ...record.resolutions };
+      if (record.tabId === tabId) {
+        remoteNotice = `检测到上次未完成的 ${record.conflicts.length} 处协作冲突，双方草稿都已保留，可继续确认或稍后重试。`;
+      } else {
+        remoteNotice = `检测到另一个标签页留下的 ${record.conflicts.length} 处未解决冲突，草稿仍可找回并重新合并。`;
+      }
+    } catch {
+      localStorage.removeItem(CONFLICT_KEY);
+    }
+  }
+
+  // ---------- 标签页草稿找回 ----------
+
+  function draftKey(id: string = tabId): string {
+    return `${DRAFT_KEY_PREFIX}${id}`;
+  }
+
+  function persistTabDraft(resetBase = false, current?: Course): void {
+    if (!hydrated || !tabId) return;
+    const existing = readOwnDraft();
+    const base = resetBase || !existing ? cloneCourse(current ?? course) : existing.base;
+    const record: TabDraft = {
+      tabId,
+      savedAt: new Date().toISOString(),
+      base: resetBase ? cloneCourse(current ?? course) : base,
+      draft: cloneCourse(current ?? course)
+    };
+    localStorage.setItem(draftKey(), JSON.stringify(record));
+  }
+
+  function readOwnDraft(): TabDraft | null {
+    return readDraft(tabId);
+  }
+
+  function readDraft(id: string): TabDraft | null {
+    const stored = localStorage.getItem(draftKey(id));
+    if (!stored) return null;
+    try {
+      return JSON.parse(stored) as TabDraft;
+    } catch {
+      return null;
+    }
+  }
+
+  function otherDraftIds(): string[] {
+    const ids: string[] = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(DRAFT_KEY_PREFIX)) {
+        const id = key.slice(DRAFT_KEY_PREFIX.length);
+        if (id !== tabId) ids.push(id);
+      }
+    }
+    return ids;
+  }
+
+  function recoverOrphanDraft(): void {
+    pruneDrafts();
+    const candidates = otherDraftIds()
+      .map((id) => readDraft(id))
+      .filter((draft): draft is TabDraft => Boolean(draft))
+      .sort((left, right) => right.savedAt.localeCompare(left.savedAt));
+    const candidate = candidates[0];
+    if (!candidate) return;
+    orphanDraft = candidate;
+    orphanDraftNotice = `找到标签页 ${candidate.tabId.slice(-5)} 于 ${formatTime(candidate.savedAt)} 留下的未合并草稿（基线修订 ${candidate.base.revision}），可找回后重新合并。`;
+  }
+
+  function pruneDrafts(): void {
+    const now = Date.now();
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(DRAFT_KEY_PREFIX)) continue;
+      try {
+        const draft = JSON.parse(localStorage.getItem(key) ?? '{}') as TabDraft;
+        if (!draft.savedAt || now - new Date(draft.savedAt).getTime() > DRAFT_TTL_MS) localStorage.removeItem(key);
+      } catch {
+        localStorage.removeItem(key);
+      }
+    }
+  }
+
+  function recoverDraftNow(): void {
+    if (!orphanDraft) return;
+    const base = normalizeRevision(cloneCourse(orphanDraft.base));
+    const ours = normalizeRevision(cloneCourse(orphanDraft.draft));
+    const remote = readRemoteCourse() ?? base;
+    const result = mergeCourses(base, ours, remote, {});
+    if (result.merged) {
+      adoptMergedCourse(result.merged, remote, false);
+      orphanDraft = null;
+      orphanDraftNotice = '';
+      return;
+    }
+    openConflictPanel(base, ours, remote, result.conflicts, {});
+  }
+
+  function dismissOrphanDraft(): void {
+    orphanDraft = null;
+    orphanDraftNotice = '';
+  }
+
+  function conflictFieldLabel(conflict: ConflictItem): string {
+    return conflict.field ? fieldLabel(conflict.field) : '活动顺序';
+  }
+
+  function compareConflictPairText(conflict: ConflictItem): { label: string; value: string; choice: string }[] {
+    return [
+      { label: conflict.oursLabel, value: conflict.oursValue, choice: 'ours' },
+      { label: conflict.theirsLabel, value: conflict.theirsValue, choice: 'theirs' }
+    ];
   }
 
   function handleKeyboard(event: KeyboardEvent): void {
@@ -563,11 +1112,13 @@
       <span class:connected={online} class="network-dot"></span>
       <span>{online ? '本地离线编辑可用' : '当前离线，修改仍会保存'}</span>
       <strong>{savedLabel}</strong>
+      <Tag type="cyan" title="课程修订号：每次成功保存递增，多标签页据此检测并发修改">修订 {course.revision}</Tag>
+      <Tag type="gray" title="本标签页编号">标签页 {tabId.slice(-5)}</Tag>
     </div>
     <div class="header-actions">
       <Button size="small" kind="ghost" disabled={history.length === 0} on:click={undo}>撤销</Button>
       <Button size="small" kind="ghost" disabled={future.length === 0} on:click={redo}>重做</Button>
-      <Button size="small" kind="tertiary" on:click={saveNow}>保存</Button>
+      <Button size="small" kind="tertiary" on:click={saveNow}>{conflictPanelOpen ? '解决冲突' : '保存'}</Button>
       <Button size="small" kind="primary" on:click={saveVersion}>存档版本</Button>
     </div>
   </header>
@@ -575,6 +1126,57 @@
   {#if showOfflineNotice}
     <div class="offline-notice">
       <InlineNotification lowContrast kind="info" title="已切换到离线模式" subtitle="所有修改会先保存在本机浏览器，恢复网络后仍可继续编辑。" />
+    </div>
+  {/if}
+
+  {#if remoteNotice}
+    <div class="collab-banner">
+      <InlineNotification
+        lowContrast
+        kind="info"
+        title="多标签页协作提示"
+        subtitle={remoteNotice}
+      >
+        <svelte:fragment slot="actions">
+          {#if activeConflict}
+            <NotificationActionButton on:click={resumeConflictPanel}>继续解决冲突</NotificationActionButton>
+          {:else}
+            <NotificationActionButton on:click={mergeFromNotice}>合并并保存</NotificationActionButton>
+            <NotificationActionButton on:click={dismissRemoteNotice}>稍后</NotificationActionButton>
+          {/if}
+        </svelte:fragment>
+      </InlineNotification>
+    </div>
+  {/if}
+
+  {#if orphanDraftNotice}
+    <div class="collab-banner">
+      <InlineNotification
+        lowContrast
+        kind="warning"
+        title="找回其他标签页草稿"
+        subtitle={orphanDraftNotice}
+      >
+        <svelte:fragment slot="actions">
+          <NotificationActionButton on:click={recoverDraftNow}>找回并重新合并</NotificationActionButton>
+          <NotificationActionButton on:click={dismissOrphanDraft}>忽略</NotificationActionButton>
+        </svelte:fragment>
+      </InlineNotification>
+    </div>
+  {/if}
+
+  {#if staleNotice}
+    <div class="collab-banner">
+      <InlineNotification
+        lowContrast
+        kind="warning"
+        title="旧检查结果过期"
+        subtitle={staleNotice}
+      >
+        <svelte:fragment slot="actions">
+          <NotificationActionButton on:click={dismissStaleNotice}>知道了</NotificationActionButton>
+        </svelte:fragment>
+      </InlineNotification>
     </div>
   {/if}
 
@@ -746,6 +1348,27 @@
         <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
         <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
       </div>
+
+      {#if checkReport}
+        <Tile class="report-card">
+          <div class="report-head">
+            <div>
+              <span class="kicker">CHECK REPORT</span>
+              <h3>{checkReport.label}</h3>
+              <p>生成于 {formatTime(checkReport.checkedAt)} · 活动指纹 {checkReport.fingerprint}</p>
+            </div>
+            {#if checkReport.stale}
+              <Tag type="red">已过期 · 已自动重算</Tag>
+            {:else}
+              <Tag type="green">当前有效</Tag>
+            {/if}
+          </div>
+          {#if checkReport.stale}
+            <InlineNotification lowContrast kind="warning" title={checkReport.staleReason ?? '旧检查结果已过期'} subtitle="过期结果不能再用于判断课程质量，下方列表始终基于当前修订重新计算。" />
+          {/if}
+        </Tile>
+      {/if}
+
       <div class="issue-board">
         {#each diagnostics as issue, index}
           <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
@@ -771,34 +1394,54 @@
   {#if activeView === 'versions'}
     <main class="versions-view">
       <div class="view-heading">
-        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。</p></div>
+        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>未封存版本会在活动变化后立即过期，不能用于比较或复制；封存后长期有效。</p></div>
         <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
       </div>
       <div class="version-layout-svelte">
         <Tile class="version-timeline">
-          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{course.versions.length} 个快照</Tag></div>
+          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{usableVersions.length}/{course.versions.length} 个有效</Tag></div>
           {#each course.versions as version, index (version.id)}
-            <article class:latest={index === course.versions.length - 1}>
+            <article class:latest={index === course.versions.length - 1} class:stale-version={version.stale}>
               <span class="timeline-dot"></span>
-              <div><b>{version.label}</b><h4>{version.note}</h4><p>{formatTime(version.savedAt)} · {version.activities.length} 个活动</p></div>
+              <div class="version-entry">
+                <div class="version-line">
+                  <b>{version.label}</b>
+                  {#if version.sealed}<Tag type="green">已封存</Tag>{:else if version.stale}<Tag type="red">已过期</Tag>{:else}<Tag type="cyan">未封存</Tag>{/if}
+                </div>
+                <h4>{version.note}</h4>
+                <p>{formatTime(version.savedAt)} · {version.activities.length} 个活动 · 指纹 {version.fingerprint}</p>
+                {#if version.stale}
+                  <small class="stale-text">{version.staleReason ?? '活动已变化，此未封存版本已过期'}</small>
+                {/if}
+                {#if !version.sealed && !version.stale}
+                  <div class="version-row-actions">
+                    <Button size="small" kind="ghost" on:click={() => sealVersion(version.id)}>封存此版本</Button>
+                  </div>
+                {/if}
+                {#if !version.stale}
+                  <div class="version-row-actions">
+                    <Button size="small" kind="ghost" on:click={() => copyVersion(version.id)}>从此版本复制活动</Button>
+                  </div>
+                {/if}
+              </div>
             </article>
           {/each}
         </Tile>
         <Tile class="diff-card">
-          <div class="section-title"><div><span class="kicker">COMPARE</span><h3>比较两个版本</h3></div></div>
+          <div class="section-title"><div><span class="kicker">COMPARE</span><h3>比较两个版本</h3><p>只有未过期版本可比较；过期版本已从下拉列表中移除。</p></div></div>
           <div class="compare-pickers">
             <Select labelText="基准版本" selected={compareBaseId} on:change={(event) => compareBaseId = readText(event)}>
-              {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
+              {#each usableVersions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
             </Select>
             <Select labelText="目标版本" selected={compareTargetId} on:change={(event) => compareTargetId = readText(event)}>
-              {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
+              {#each usableVersions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
             </Select>
           </div>
           <div class="diff-list">
             {#each versionDiff as diff}
               <article class={diff.kind}><span>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</span><div><b>{diff.title}</b><p>{diff.detail}</p></div></article>
             {:else}
-              <p class="empty-state">两个版本之间没有活动差异，或尚未选择版本。</p>
+              <p class="empty-state">两个版本之间没有活动差异，或所选版本已过期。</p>
             {/each}
           </div>
         </Tile>
@@ -806,8 +1449,87 @@
     </main>
   {/if}
 
+  {#if conflictPanelOpen && activeConflict}
+    <div class="conflict-overlay" role="dialog" aria-modal="true" aria-label="协作冲突确认">
+      <div class="conflict-panel">
+        <header class="conflict-head">
+          <div>
+            <span class="kicker">MERGE CONFLICT</span>
+            <h2>协作保存需要确认</h2>
+            <p>
+              基线修订 {activeConflict.base.revision} · 本标签页修订 {activeConflict.ours.revision} · 其他标签页修订 {activeConflict.theirs.revision}。
+              活动顺序、依赖或音素被双方同时修改，双方草稿都已保留，逐项确认后才会生效。
+            </p>
+          </div>
+          <Tag type={unresolvedCount ? 'red' : 'green'}>{unresolvedCount ? `${unresolvedCount} 项待确认` : '全部已确认'}</Tag>
+        </header>
+
+        <div class="conflict-list">
+          {#each activeConflict.conflicts as conflict, index (conflict.key)}
+            <section class="conflict-item" data-kind={conflict.kind}>
+              <div class="conflict-item-head">
+                <span class="conflict-index">{String(index + 1).padStart(2, '0')}</span>
+                <div>
+                  <h3>{conflict.title}</h3>
+                  <p>{conflict.description}</p>
+                  {#if conflict.scope === 'activity'}<Tag type="cool-gray">活动字段 · {conflictFieldLabel(conflict)}</Tag>{/if}
+                </div>
+              </div>
+              <div class="conflict-drafts">
+                {#each compareConflictPairText(conflict) as pair}
+                  {@const choice = resolutionChoice(conflict)}
+                  <div class:draft-chosen={choice === pair.choice || choice === 'union' || (pair.choice === 'ours' && choice === 'custom')} class="draft-box">
+                    <span class="kicker">{pair.label}</span>
+                    <pre>{pair.value}</pre>
+                  </div>
+                {/each}
+              </div>
+              <div class="conflict-options" role="radiogroup" aria-label="选择保留方案">
+                {#each conflict.options as option}
+                  <label class:chosen={resolutionChoice(conflict) === option.value}>
+                    <input
+                      type="radio"
+                      name={conflict.key}
+                      value={option.value}
+                      checked={resolutionChoice(conflict) === option.value}
+                      on:change={() => setResolution(conflict, option.value)}
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                {/each}
+                {#if conflict.kind === 'phonemes' && conflict.options.some((option) => option.value === 'custom')}
+                  <TextInput
+                    labelText="手动指定音素（逗号或空格分隔）"
+                    value={resolutionCustom(conflict)}
+                    placeholder="/m/ /s/ /æ/"
+                    on:input={(event) => setCustomResolution(conflict, readText(event))}
+                  />
+                {/if}
+              </div>
+            </section>
+          {/each}
+        </div>
+
+        {#if applyError}
+          <InlineNotification lowContrast kind="error" title="冲突尚未全部生效" subtitle={applyError} />
+        {/if}
+
+        <footer class="conflict-foot">
+          <p>确认前两份草稿都不会被覆盖；关闭面板或处理失败后，可在横幅中随时找回并重试。</p>
+          <div class="conflict-actions">
+            <Button kind="ghost" on:click={discardConflictDraft}>放弃记录，保留本草稿</Button>
+            <Button kind="tertiary" on:click={closeConflictPanel}>稍后处理</Button>
+            <Button kind="primary" disabled={unresolvedCount > 0} on:click={applyConflictResolutions}>
+              {unresolvedCount ? `还剩 ${unresolvedCount} 项待确认` : '确认并生效'}
+            </Button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  {/if}
+
   <footer class="app-footer">
-    <span>所有数据保存在当前浏览器 localStorage</span>
-    <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Alt + N 新建活动 · Ctrl/Cmd + S 保存</span>
+    <span>所有数据保存在当前浏览器 localStorage · 修订号 {course.revision}</span>
+    <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Alt + N 新建活动 · Ctrl/Cmd + S 保存/解决冲突</span>
   </footer>
 </div>

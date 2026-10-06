@@ -9,6 +9,7 @@
     "prebuild": "svelte-kit sync",
     "prepare": "svelte-kit sync",
     "preview": "vite preview --host 0.0.0.0",
+    "test:merge": "esbuild scripts/test-merge.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-merge.mjs && node node_modules/.cache/test-merge.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
